@@ -1,18 +1,24 @@
 """
-Moduł 1 - identyfikacja, uwierzytelnianie i autoryzacja (wariant 4)
+Moduł 2 - zabezpieczenia przed botami, ruchem automatycznym i wyciekiem danych
+(aplikacja z modułu 1 rozbudowana o: limit błędnych logowań, CAPTCHA, pułapkę na boty, Canarytokens)
 
 Instalacja:   python -m pip install flask
 Uruchomienie: python app.py  ->  http://127.0.0.1:5000
+Test bota:    python bot_test.py  (w drugim oknie, gdy aplikacja działa)
 
 Pierwsze uruchomienie tworzy app.db (ADMIN + 6 kont testowych).
 Przy każdym starcie terminal wypisuje hasła jednorazowe kont bez własnego hasła.
 Reset bazy: usuń app.db.
 """
 import functools
+import json
 import secrets
 import sqlite3
 import string
+import threading
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from flask import Flask, abort, flash, g, redirect, render_template, request, session, url_for
@@ -36,6 +42,7 @@ DEFAULT_SETTINGS = {
     "require_distinct_chars": 0,          # 1 = reguła 8 różnych znaków włączona
     "password_max_age_days": 0,           # 0 = bez limitu
     "session_timeout_minutes": 15,
+    "max_failed_logins": 5,               # tyle błędnych haseł z rzędu -> blokada konta
 }
 
 # RBAC wg zasady najmniejszych uprawnień
@@ -50,6 +57,20 @@ USER_ROLES = ["Audytor", "Redaktor", "Czytelnik"]   # Administrator tylko dla ko
 TEST_USERS = [("audytor1", "Audytor"), ("audytor2", "Audytor"),
               ("redaktor1", "Redaktor"), ("redaktor2", "Redaktor"),
               ("czytelnik1", "Czytelnik"), ("czytelnik2", "Czytelnik")]
+
+# ===================== Moduł 2: CAPTCHA, limit prób, Canarytokens =====================
+
+# Cloudflare Turnstile. Domyślnie klucze testowe Cloudflare - wpisz klucze swojego widżetu.
+TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
+TURNSTILE_SECRET_KEY = "1x0000000000000000000000000000000AA"
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+
+LOCK_TIME = 15 * 60                       # czas blokady po przekroczeniu limitu prób: 15 min
+
+# Canarytokens (canarytokens.org). Przynęta: komentarz w kodzie HTML strony logowania.
+TRAP_LOGIN = "serwis"                     # konto-pułapka (nie istnieje, nikt uprawniony go nie używa)
+CANARY_TRAP_URL = "http://canarytokens.com/traffic/articles/qamvs9un3c68qwg5i9k4sziz1/payments.js"                # token HTTP (Web bug) - wywoływany przy użyciu konta-pułapki
+BACKUP_DB_HOST = "1kskrmvic2fecao5fc2r5byx1.canarytokens.com"                # token DNS - fałszywy adres serwera kopii zapasowej bazy
 
 # ===================== Hasła =====================
 # Hash z solą: generate_password_hash / check_password_hash (Werkzeug, scrypt).
@@ -76,7 +97,9 @@ CREATE TABLE users (
     must_change_password INTEGER NOT NULL DEFAULT 1,  -- 1 = hasło jednorazowe
     otp_expires_at       REAL,               -- ważność hasła jednorazowego
     password_changed_at  REAL,               -- data ustawienia własnego hasła
-    is_blocked           INTEGER NOT NULL DEFAULT 0
+    is_blocked           INTEGER NOT NULL DEFAULT 0,
+    failed_logins        INTEGER NOT NULL DEFAULT 0,  -- błędne hasła z rzędu
+    locked_until         REAL                         -- koniec blokady po przekroczeniu limitu
 );
 CREATE TABLE password_history (              -- poprzednie hasła
     user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -203,7 +226,43 @@ def login_required(permission=None):
 def template_variables():
     user = g.get("user")
     timeout = get_settings()["session_timeout_minutes"] * 60 if user else 0
-    return {"current_user": user, "can": can, "ADMIN_LOGIN": ADMIN_LOGIN, "timeout_seconds": timeout}
+    return {"current_user": user, "can": can, "ADMIN_LOGIN": ADMIN_LOGIN, "timeout_seconds": timeout,
+            "TURNSTILE_SITE_KEY": TURNSTILE_SITE_KEY, "TRAP_LOGIN": TRAP_LOGIN, "BACKUP_DB_HOST": BACKUP_DB_HOST}
+
+# ===================== Moduł 2: CAPTCHA, blokada, pułapka =====================
+
+def captcha_ok():
+    """Weryfikuje token Turnstile na serwerze Cloudflare (token jednorazowy, ważny 300 s)."""
+    token = request.form.get("cf-turnstile-response", "")
+    if not token:
+        return False
+    data = urllib.parse.urlencode({"secret": TURNSTILE_SECRET_KEY, "response": token,
+                                   "remoteip": request.remote_addr}).encode()
+    try:
+        with urllib.request.urlopen(TURNSTILE_VERIFY_URL, data, timeout=10) as response:
+            return json.load(response).get("success") is True
+    except (OSError, ValueError):                 # brak połączenia lub błędna odpowiedź = odrzucenie
+        return False
+
+
+def lock_message(locked_until):
+    left = round(locked_until - time.time())
+    return (f"Konto zablokowane po zbyt wielu błędnych logowaniach. "
+            f"Pozostały czas blokady: {left // 60} min {left % 60} s.")
+
+
+def send_canary_alert():
+    try:
+        urllib.request.urlopen(CANARY_TRAP_URL, timeout=10).close()
+    except OSError as error:
+        print("[ALARM] Nie udało się wysłać alertu Canarytokens:", error, flush=True)
+
+
+def trap_alert():
+    """Użycie konta-pułapki: wpis w terminalu i alert Canarytokens (w tle, bez opóźniania odpowiedzi)."""
+    print(f"[ALARM] Próba logowania na konto-pułapkę '{TRAP_LOGIN}' z adresu {request.remote_addr}", flush=True)
+    if CANARY_TRAP_URL:
+        threading.Thread(target=send_canary_alert, daemon=True).start()
 
 # ===================== Strony =====================
 
@@ -213,14 +272,35 @@ def template_variables():
 def login():
     error = None
     if request.method == "POST":
-        user = query("SELECT * FROM users WHERE login = ?", (request.form.get("login", ""),), one=True)
-        if user is None or not check_password_hash(user["password_hash"], request.form.get("password", "")):
+        login_name = request.form.get("login", "")
+        user = query("SELECT * FROM users WHERE login = ?", (login_name,), one=True)
+        if login_name == TRAP_LOGIN:                             # konto-pułapka -> alert
+            trap_alert()
             error = "Login lub hasło niepoprawne"
+        elif request.form.get("website"):                        # ukryte pole wypełnia tylko bot
+            print(f"[BOT] Wypełnione ukryte pole formularza logowania, adres {request.remote_addr}", flush=True)
+            error = "Login lub hasło niepoprawne"
+        elif not captcha_ok():
+            error = "Weryfikacja CAPTCHA nie powiodła się. Spróbuj ponownie."
+        elif user and user["locked_until"] and time.time() < user["locked_until"]:
+            error = lock_message(user["locked_until"])           # trwa blokada: pozostały czas
+        elif user is None or not check_password_hash(user["password_hash"], request.form.get("password", "")):
+            error = "Login lub hasło niepoprawne"
+            if user:                                             # licznik błędnych haseł, po limicie blokada
+                failed = user["failed_logins"] + 1
+                if failed >= get_settings()["max_failed_logins"]:
+                    locked_until = time.time() + LOCK_TIME
+                    execute("UPDATE users SET failed_logins = 0, locked_until = ? WHERE id = ?",
+                            (locked_until, user["id"]))
+                    error = lock_message(locked_until)
+                else:
+                    execute("UPDATE users SET failed_logins = ? WHERE id = ?", (failed, user["id"]))
         elif user["is_blocked"]:
             error = "Konto jest zablokowane."
         elif user["must_change_password"] and time.time() > user["otp_expires_at"]:
             error = "Hasło jednorazowe wygasło. Poproś administratora o reset hasła."
         else:
+            execute("UPDATE users SET failed_logins = 0 WHERE id = ?", (user["id"],))
             session.clear()
             session["user_id"] = user["id"]
             session["last_activity"] = time.time()
@@ -251,7 +331,9 @@ def change_password():
     if request.method == "POST":
         old = request.form.get("old_password", "")
         new = request.form.get("new_password", "")
-        if not check_password_hash(g.user["password_hash"], old):
+        if not captcha_ok():                                     # formularz bez poprawnego tokenu odrzucony
+            errors.append("Weryfikacja CAPTCHA nie powiodła się. Spróbuj ponownie.")
+        elif not check_password_hash(g.user["password_hash"], old):
             errors.append("Stare hasło jest niepoprawne.")
         elif new != request.form.get("repeat_password", ""):
             errors.append("Nowe hasło i jego powtórzenie nie są takie same.")
@@ -338,12 +420,14 @@ def settings_page():
                 "require_distinct_chars": 1 if request.form.get("require_distinct_chars") else 0,
                 "password_max_age_days": int(request.form["password_max_age_days"]),
                 "session_timeout_minutes": int(request.form["session_timeout_minutes"]),
+                "max_failed_logins": int(request.form["max_failed_logins"]),
             }
         except (KeyError, ValueError):
             new_settings = None
         if (new_settings is None or new_settings["min_password_length"] < 1
                 or new_settings["password_max_age_days"] < 0
-                or not 1 <= new_settings["session_timeout_minutes"] <= 1440):
+                or not 1 <= new_settings["session_timeout_minutes"] <= 1440
+                or new_settings["max_failed_logins"] < 1):
             flash("Podaj poprawne liczby.")
         else:
             for key, value in new_settings.items():
@@ -372,7 +456,7 @@ TEMPLATES = {
 <html lang="pl">
 <head>
 <meta charset="utf-8">
-<title>Moduł 1 - wariant 4</title>
+<title>Moduł 2 - wariant 4</title>
 <style>
   body { margin: 0; font-family: system-ui, "Segoe UI", Arial, sans-serif; background: #f3f4f6; color: #1f2937; }
   nav { display: flex; gap: 18px; align-items: center; padding: 14px 24px; background: #111827; }
@@ -394,6 +478,7 @@ TEMPLATES = {
   td button { margin: 0 0 0 6px; padding: 4px 10px; font-size: 14px; }
   .message { padding: 10px 14px; margin-bottom: 16px; border-radius: 6px; background: #fef3c7; }
   .error { background: #fee2e2; color: #991b1b; }
+  .cf-turnstile { margin-top: 16px; }
 </style>
 </head>
 <body>
@@ -428,9 +513,21 @@ TEMPLATES = {
   <form method="post">
     <label>Login <input name="login" required autofocus></label>
     <label>Hasło <input name="password" type="password" required></label>
+    {# pułapka na boty: pole poza ekranem, człowiek go nie widzi i nie wypełnia #}
+    <div style="position: absolute; left: -10000px" aria-hidden="true">
+      <label>Strona WWW <input name="website" tabindex="-1" autocomplete="off"></label>
+    </div>
+    <div class="cf-turnstile" data-sitekey="{{ TURNSTILE_SITE_KEY }}"></div>
     <button>Zaloguj</button>
   </form>
 </div>
+{# przynęta dla włamywacza czytającego kod strony (Canarytokens) #}
+<!--
+  TODO usunąć przed wdrożeniem
+  konto serwisowe: {{ TRAP_LOGIN }} / Serwis2024!
+  {% if BACKUP_DB_HOST %}kopia bazy: {{ BACKUP_DB_HOST }}{% endif %}
+-->
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 {% endblock %}""",
 
     "change_password.html": """{% extends "base.html" %}
@@ -443,9 +540,11 @@ TEMPLATES = {
     <label>Nowe hasło <input name="new_password" type="password" required></label>
     <label>Powtórz nowe hasło <input name="repeat_password" type="password" required></label>
     <p>Wymagania: minimalna długość {{ settings.min_password_length }}{% if settings.require_distinct_chars %}, co najmniej 8 różnych znaków{% endif %}; hasło musi różnić się od poprzednich.</p>
+    <div class="cf-turnstile" data-sitekey="{{ TURNSTILE_SITE_KEY }}"></div>
     <button>Zmień hasło</button>
   </form>
 </div>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 {% endblock %}""",
 
     "users.html": """{% extends "base.html" %}
@@ -499,6 +598,7 @@ TEMPLATES = {
     <label><input type="checkbox" name="require_distinct_chars" {{ 'checked' if settings.require_distinct_chars }}>Polityka haseł z wariantu 4: co najmniej 8 różnych znaków</label>
     <label>Ważność hasła w dniach (0 = bez limitu) <input type="number" name="password_max_age_days" min="0" value="{{ settings.password_max_age_days }}"></label>
     <label>Czas bezczynności sesji w minutach (1-1440) <input type="number" name="session_timeout_minutes" min="1" max="1440" value="{{ settings.session_timeout_minutes }}"></label>
+    <label>Limit błędnych logowań (blokada na 15 min) <input type="number" name="max_failed_logins" min="1" value="{{ settings.max_failed_logins }}"></label>
     <button>Zapisz</button>
   </form>
 </div>
